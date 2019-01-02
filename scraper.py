@@ -9,16 +9,20 @@ import traceback
 import sys
 from utilities import *
 import settings
-
+import unidecode
 
 def scrape_agency(agency, browser):
     '''
     scrapes all agencies and saves new results to db
     '''
     slack_results = []
+    slack_results_trains = []
+    slack_result_lands = []
     gmaps = googlemaps.Client(key=settings.GMAPS_KEY)
 
+    # initialize browser
     browser.get(settings.AGENCIES[agency]['browserLink'])
+
     linkRegexp = re.compile(r'' + settings.AGENCIES[agency]['linkRegexp'] + '')
 
     # gets list of all entries on first 2 pages of agency website
@@ -30,7 +34,11 @@ def scrape_agency(agency, browser):
         nextPageRegexp = re.compile(r'{}'.format(settings.AGENCIES[agency]['nextPageRegexp']))
         nextPageLink = nextPageRegexp.findall(html_source)
         nextPageLink = nextPageLink[0].replace('"', '')
-        nextPage = settings.AGENCIES[agency]['url'] + nextPageLink
+        if 'BEZREALITKY' not in agency:
+            nextPage = settings.AGENCIES[agency]['url'] + nextPageLink
+        else:
+            nextPage = nextPageLink
+
         browser.get(nextPage)
 
     linkMatch = list(unique_everseen(linkMatch))
@@ -51,7 +59,7 @@ def scrape_agency(agency, browser):
         except psycopg2.IntegrityError:
             con.commit()
 
-    # selects all links which havent been scrapped yet
+    # selects all links which haven't been scrapped yet
     sql = 'select link,id from realitky WHERE realitky."isChecked" = \'FALSE\' AND link LIKE \'%{}%\''.format(settings.AGENCIES[agency]['url'])
     cur.execute(sql)
     to_check = cur.fetchall()
@@ -62,19 +70,34 @@ def scrape_agency(agency, browser):
         time.sleep(8)
         locationRegexp = re.compile(r'{}'.format(settings.AGENCIES[agency]['locationRegexp']))
         location = locationRegexp.findall(browser.page_source)
-        location = location[0]
-        location = location.replace('Panorama', '')
+        try:
+            location = location[0]
+        except Exception:
+            location = 'N/A'
+            # traceback.print_exc()
+            continue
+
+        location = location.replace('Panorama', '')  # exception for sreality, which sometimes adds word panorama
+
+        separator = 'okres'
+        location = location.split(separator, 1)[0]
+
+        location = unidecode.unidecode(location)
+        location = location.lower()
 
         priceRegexp = re.compile(r'{}'.format(settings.AGENCIES[agency]['priceRegexp']))
         price = priceRegexp.findall(browser.page_source)
         price = price[0]
 
-        sizeRegexp = re.compile(r'{}'.format(settings.AGENCIES[agency]['sizeRegexp']))
-        size = sizeRegexp.findall(browser.page_source)
-        size = size[0]
+        if price == "Cena na vyžádání":
+            continue
+
+        # sizeRegexp = re.compile(r'{}'.format(settings.AGENCIES[agency]['sizeRegexp']))
+        # size = sizeRegexp.findall(browser.page_source)
+        # size = size[0]
 
         try:
-            distance, duration = check_maps(location, gmaps)
+            distance, duration = 'x km', 'x minutes'
         except Exception:
             print("Error: ", sys.exc_info()[0])
             traceback.print_exc()
@@ -82,17 +105,32 @@ def scrape_agency(agency, browser):
 
         try:
             cur.execute(
-                'UPDATE  realitky SET location=%s, "isChecked"=%s, price=%s, distance=%s, duration=%s, size=%s  WHERE id=%s',
-                (location, 'TRUE', price, distance, duration, size, data[1]))
-            entry = data[0] + '\nPrice: ' + price + '\nSize: ' + size + '\nLocation: ' + location + '\nDistance: ' + distance + '\nDuration: ' + duration
+                'UPDATE  realitky SET location=%s, "isChecked"=%s, price=%s, distance=%s, duration=%s  WHERE id=%s',
+                (location, 'TRUE', price, distance, duration, data[1]))
+            entry = data[0] + '\nPrice: ' + price  + '\nLocation: ' + location + '\nDistance: ' + distance + '\nDuration: ' + duration
             con.commit()
 
         except psycopg2.IntegrityError:
             print('Not working: ' + data[0])
             con.commit()
-        slack_results.append(entry)
 
-    return slack_results
+        if 'lands' in agency:
+            if any(city in location for city in settings.CITIES):
+                slack_result_lands.append(entry)
+                continue
+
+            else:
+                continue
+
+        # send to slack only desired cities
+
+        if any(city in location for city in settings.CITIES):
+            slack_results_trains.append(entry)
+            continue
+        else:
+            continue
+
+    return slack_results, slack_results_trains, slack_result_lands
 
 
 def do_scrape():
@@ -104,13 +142,31 @@ def do_scrape():
     browser_window = webdriver.Firefox()
 
     all_results = []
+    all_results_trains = []
+    all_results_lands = []
     for agency in settings.AGENCIES:
-        all_results += scrape_agency(agency, browser_window)
+        if 'IDNES' in agency:
+            continue
+        default_result, train_result, land_result = scrape_agency(agency, browser_window)
+        all_results += default_result
+        all_results_trains += train_result
+        all_results_lands += land_result
 
     browser_window.quit()
-    print("{}: Got {} new results".format(time.ctime(), len(all_results)))
+    print("{}: Got {} new results".format(time.ctime(), (len(all_results_lands) + len(all_results_trains))))
 
     # send each result to slack
 
-    for result in all_results:
-        send_to_slack(sc, result)
+    # for result in all_results:
+    #    trains = 'no_trains'
+    #    send_to_slack(sc, result, trains)
+
+    for result in all_results_trains:
+        trains = 'trains'
+        send_to_slack(sc, result, trains)
+
+    for result in all_results_lands:
+        trains = 'lands'
+        send_to_slack(sc, result, trains)
+
+
