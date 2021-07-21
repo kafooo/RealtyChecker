@@ -4,6 +4,8 @@ import time
 import sys
 import traceback
 
+#test branches
+
 if __name__ == "__main__":
     while True:
         print("{}: Starting scraping cycle".format(time.ctime()))
